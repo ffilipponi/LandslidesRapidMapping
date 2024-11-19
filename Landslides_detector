@@ -1,0 +1,891 @@
+#!/usr/bin/env bash
+
+# ######################################################
+#
+# Script Name: Landslides_detector
+# Version: 0.7
+#
+# Author: Federico Filipponi
+# Maintainer: Federico Filipponi <federico.filipponi@gmail.com>
+# Date : 05.06.2024
+#
+# Copyright name: CC BY-NC-SA
+# License: GPLv3
+#
+# Purpose: Script to orchestrate landslides detection operator
+#
+# Usage examples: 
+# 
+# Landslides_detector -o /output_folder -d /data/dem.tif -c /data/PostEvent_NDWI.tif -a /data/PreEvent_NDVI.tif -b /data/PostEvent_NDVI.tif
+# 
+# Landslides_detector -v -t 0.2 -p "20230428_20230523" -o /output_folder -n /data/AoI.gpkg -m /data/raster_mask.tif -l /data/Soil_sealing_mask.tif -d /data/dem.tif -c /data/PostEvent_NDWI.tif -a /data/PreEvent_NDVI.tif -b /data/PostEvent_NDVI.tif -e /data/PreEvent_cloud_mask.tif -f /data/PostEvent_cloud_mask.tif
+# 
+# ######################################################
+# 
+# ChangeLog
+# 
+# Version 0.1
+# 2023/05/26
+# 
+# First Release
+#
+# Version 0.5
+# 2024/01/16
+# 
+# Added argument parser
+# Set gdal_calc parallel computation
+# Automatic call of R scripts
+# Check input CRS extent and resolution and harmonize data
+#
+# Version 0.5
+# 2024/01/16
+# 
+# Fix to check if input masks exist before their pre-processing
+#
+# Version 0.6
+# 2024/06/05
+# 
+# Updated formula used to calculate confidence
+# 
+# #############################
+# Set Help function
+Help()
+{
+  # Display command help
+  echo "Usage : Landslides_detector.sh [Options] -o /output_folder -a pre_event_NDVI.tif -b post_event_NDVI.tif -c post_event_NDWI.tif -d DEM.tif"
+  echo ""
+  echo "Options:"
+  echo "    -a             Input pre-event NDVI raster file path"
+  echo "    -b             Input post-event NDVI raster file path"
+  echo "    -c             Input post-event NDWI raster file path"
+  echo "    -d             Input DEM raster file path"
+  echo "    -e             Input pre-event raster mask file path (optional)"
+  echo "    -f             Input post-event raster mask file path (optional)"
+  echo "    -h             Help information for the operator"
+  echo "    -l             Input artificial surfaces raster mask file path (optional)"
+  echo "    -m             Input raster mask file path (optional)"
+  echo "    -n             Input vector mask file path (optional)"
+  echo "    -o <output>    Output folder path"
+  echo "    -p             Prefix to be used for output file naming (optional)"
+  echo "    -s             Small Area Threshold to be used to remove small polygons (default: 0)"  
+  echo "    -t             Threshold to be used to identify changes from RdNDVI (default: 0.2)"
+  echo "    -v             Verbose mode"
+  # echo ""
+  # echo "  Landslides detector orchestrator 0.5, GPL v3, CC BY-NC-SA 2023-2024 Federico Filipponi"
+  # echo "  This is free software and comes with ABSOLUTELY NO WARRANTY"
+}
+
+# set default parameters
+# OVERRIDE_TE="FALSE"
+OVERRIDE_TE="TRUE"
+MIN_AREA=0
+RDNDVI_THRESHOLD=0.2
+PREFIX=""
+AOI_MASK="NONE"
+
+# get options
+while getopts ":a:b:c:d:e:f:l:m:n:o:p:s:t:hv" opt; do
+  case $opt in
+    a)
+      PRE_NDVI=$OPTARG
+      ;;
+    b)
+      POST_NDVI=$OPTARG
+      ;;
+    c)
+      POST_NDWI=$OPTARG
+      ;;
+    d)
+      DEM_FILE=$OPTARG
+      ;;
+    e)
+      PRE_MASK=$OPTARG
+      ;;
+    f)
+      POST_MASK=$OPTARG
+      ;;
+    l)
+      SS_FILE=$OPTARG
+      ;;
+    m)
+      MASK_FILE=$OPTARG
+      ;;
+    n)
+      AOI_VFILE=$OPTARG
+      ;;
+    o)
+      OUTPUT_PATH=$OPTARG
+      ;;
+    p)
+      PREFIX=$OPTARG
+      ;;
+    s)
+      MIN_AREA=$OPTARG
+      ;;
+    t)
+      RDNDVI_THRESHOLD=$OPTARG
+      ;;
+    v)
+      VERBOSE="TRUE"
+      ;;
+    h)
+      Help
+      exit 1
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :a:b:c:d:e:f:l:m:n:o:p:s:t:)
+      echo "Option -$OPTARG requires an argument." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# ########################################
+# check input arguments
+
+if [ $# -eq 0 ]
+then
+  Help
+  exit 1
+fi
+
+if [ -z $OUTPUT_PATH ]
+then
+  echo "ERROR: Output folder name not set using the '-o' argument." >&2
+  exit 1
+fi
+# check if output file already exists
+if [ -d $OUTPUT_PATH ]
+then
+  echo "ERROR: Output folder already exists. Set another output folder name using the '-o' argument." >&2
+  exit 1
+else
+  OUTPUT_PATH=${OUTPUT_PATH%%/}
+fi
+
+# check if input file are provided and exists
+if [ -z $PRE_NDVI ]
+then
+  echo "ERROR: Input pre-event NDVI raster file path not set using the '-a' argument." >&2
+  exit 1
+else
+  if [ ! -f $PRE_NDVI ]
+  then
+    echo "ERROR: Input pre-event NDVI raster file does not exist. Set another file path name using the '-a' argument." >&2
+    exit 1
+  fi
+fi
+if [ -z $POST_NDVI ]
+then
+  echo "ERROR: Input post-event NDVI raster file path not set using the '-b' argument." >&2
+  exit 1
+else
+  if [ ! -f $POST_NDVI ]
+  then
+    echo "ERROR: Input pre-event NDVI raster file does not exist. Set another file path name using the '-b' argument." >&2
+    exit 1
+  fi
+fi
+if [ -z $POST_NDWI ]
+then
+  echo "ERROR: Input post-event NDWI raster file path not set using the '-c' argument." >&2
+  exit 1
+else
+  if [ ! -f $POST_NDWI ]
+  then
+    echo "ERROR: Input pre-event NDWI raster file does not exist. Set another file path name using the '-c' argument." >&2
+    exit 1
+  fi
+fi
+if [ -z $DEM_FILE ]
+then
+  echo "ERROR: Input DEM raster file path not set using the '-d' argument." >&2
+  exit 1
+else
+  if [ ! -f $DEM_FILE ]
+  then
+    echo "ERROR: Input DEM raster file does not exist. Set another file path name using the '-d' argument." >&2
+    exit 1
+  fi
+fi
+
+# check optional file
+if [ ! -z $PRE_MASK ] & [ ! -f $PRE_MASK ]
+then
+  echo "ERROR: Input pre-event raster mask file does not exist. Set another file path name using the '-e' argument." >&2
+  exit 1
+fi
+if [ ! -z $POST_MASK ] & [ ! -f $POST_MASK ]
+then
+  echo "ERROR: Input post-event raster mask file does not exist. Set another file path name using the '-f' argument." >&2
+  exit 1
+fi
+if [ ! -z $SS_FILE ] & [ ! -f $SS_FILE ]
+then
+  echo "ERROR: Input artificial surfaces raster mask file does not exist. Set another file path name using the '-l' argument." >&2
+  exit 1
+fi
+if [ ! -z $MASK_FILE ] & [ ! -f $MASK_FILE ]
+then
+  echo "ERROR: Input raster mask file does not exist. Set another file path name using the '-m' argument." >&2
+  exit 1
+fi
+if [ ! -z $AOI_VFILE ] & [ ! -f $AOI_VFILE ]
+then
+  echo "ERROR: Input vector mask file does not exist. Set another file path name using the '-n' argument." >&2
+  exit 1
+fi
+
+# check software and library dependencies
+if [[ ! -x $(command -v sed) ]]
+then
+  echo "ERROR: 'sed' is not installed." >&2
+  exit 1
+fi
+if [[ ! -x $(command -v bc) ]]
+then
+  echo "ERROR: 'bc' is not installed." >&2
+  exit 1
+fi
+if [[ ! -x $(command -v grep) ]]
+then
+  echo "ERROR: 'grep' is not installed." >&2
+  exit 1
+fi
+if [[ ! -x $(command -v R) ]]
+then
+  echo "ERROR: 'R' is not installed." >&2
+  exit 1
+fi
+if [[ ! -x $(command -v gdalinfo) ]]
+then
+  echo "ERROR: 'GDAL' is not installed." >&2
+  exit 1
+fi
+if [[ ! -x $(command -v gdal_calc.py) ]]
+then
+  echo "ERROR: 'GDAL' is not installed." >&2
+  exit 1
+fi
+
+# check GDAL version
+GDAL_VERSION=$(gdalinfo --version | sed -n 's/,.*//p' | sed 's/GDAL //')
+GDAL_VERSION=$(echo $GDAL_VERSION | sed -e 's/[.].*//g')
+GDAL_VERSION=$((GDAL_VERSION + 0))
+if [[ $GDAL_VERSION -lt 3 ]]
+then
+  echo "ERROR: GDAL version >= 3.4 is required." >&2
+  exit 1
+else
+  GDAL_SUBVERSION=$(gdalinfo --version | sed -n 's/,.*//p' | sed 's/GDAL //' | sed -e 's/[.]/&\n/;s/.*\n//;s/[.]/\n&/;s/\n.*//')
+  GDAL_SUBVERSION=$((GDAL_SUBVERSION + 0))
+  if [[ $GDAL_SUBVERSION -lt 4 ]]
+  then
+    echo "ERROR: GDAL version >= 3.4 is required." >&2
+    exit 1
+  fi
+fi
+
+# check prefix
+if [ ! -z $PREFIX ]
+then
+  PREFIX="${PREFIX}_"
+fi
+
+# set environmental variables
+SCRIPT_HOME="$( cd "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
+
+# ########################################
+# time starting
+START_CYCLE="$(date +%s%N)"
+
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo ""
+  echo "--------------------------------------------------------------------------------"
+  echo "Landslides Detector Operator - version 0.5" >&1
+  echo "Started at: $(date)" >&1
+fi
+
+# create output directory
+mkdir -p ${OUTPUT_PATH}/wd
+
+# ##################
+# get scale factor from input file
+PRE_NDVI_SCALE_FACTOR=$(gdalinfo ${PRE_NDVI} | grep "Scale:" | sed -e 's/^.*Scale://g')
+if [ "$PRE_NDVI_SCALE_FACTOR" == "" ]
+then
+  PRE_NDVI_SCALE_FACTOR=1.0
+fi
+# PRE_NDVI_SCALE_RFACTOR=$(echo "1.0 / $PRE_NDVI_SCALE_FACTOR" |bc -l)
+POST_NDVI_SCALE_FACTOR=$(gdalinfo ${POST_NDVI} | grep "Scale:" | sed -e 's/^.*Scale://g')
+if [ "$POST_NDVI_SCALE_FACTOR" == "" ]
+then
+  POST_NDVI_SCALE_FACTOR=1.0
+fi
+# POST_NDVI_SCALE_RFACTOR=$(echo "1.0 / $POST_NDVI_SCALE_FACTOR" |bc -l)
+POST_NDWI_SCALE_FACTOR=$(gdalinfo ${POST_NDWI} | grep "Scale:" | sed -e 's/^.*Scale://g')
+if [ "$POST_NDWI_SCALE_FACTOR" == "" ]
+then
+  POST_NDWI_SCALE_FACTOR=1.0
+fi
+# POST_NDWI_SCALE_RFACTOR=$(echo "1.0 / $POST_NDWI_SCALE_FACTOR" |bc -l)
+
+# get 'POST_NDVI' raster extent
+ULX=$(gdalinfo ${POST_NDVI} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+ULY=$(gdalinfo ${POST_NDVI} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+LRX=$(gdalinfo ${POST_NDVI} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+LRY=$(gdalinfo ${POST_NDVI} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+
+XSIZE=$(gdalinfo ${POST_NDVI} | grep "Size is" | sed -e 's/^.*Size is //g' -e 's/,.*//g')
+YSIZE=$(gdalinfo ${POST_NDVI} | grep "Size is" | sed -e 's/^.*, //g')
+
+# get resolution
+REF_RES=$(gdalinfo ${POST_NDVI} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+
+# get 'POST_NDVI' CRS (EPSG)
+REF_EPSG=$(gdalsrsinfo --single-line -o epsg ${POST_NDVI})
+
+# generate Virtual Raster from input raster file in order to allow changes in 'scale_factor' in case they are stored in read-only mode
+gdal_translate -q -of VRT ${PRE_NDVI} ${OUTPUT_PATH}/wd/$(basename $PRE_NDVI)_source.vrt
+PRE_NDVI=${OUTPUT_PATH}/wd/$(basename $PRE_NDVI)_source.vrt
+gdal_translate -q -of VRT ${POST_NDVI} ${OUTPUT_PATH}/wd/$(basename $POST_NDVI)_source.vrt
+POST_NDVI=${OUTPUT_PATH}/wd/$(basename $POST_NDVI)_source.vrt
+gdal_translate -q -of VRT ${POST_NDWI} ${OUTPUT_PATH}/wd/$(basename $POST_NDWI)_source.vrt
+POST_NDWI=${OUTPUT_PATH}/wd/$(basename $POST_NDWI)_source.vrt
+
+if [ ! -z $AOI_VFILE ] || [ ! -z $MASK_FILE ]
+then
+  if [ "$VERBOSE" == "TRUE" ]
+  then
+    echo "Importing AoI and input raster mask ..."
+  fi
+fi
+
+# generate raster mask from vector AOI
+if [ ! -z $AOI_VFILE ]
+then
+  
+  T_EPSG=$(gdalsrsinfo --single-line -o epsg ${AOI_VFILE})
+  if [ $T_EPSG != $REF_EPSG ]
+  then
+    ogr2ogr -f "GPKG" -s_srs ${T_EPSG} -t_srs ${REF_EPSG} ${OUTPUT_PATH}/wd/AoI.gpkg ${AOI_VFILE}
+    AOI_VFILE=${OUTPUT_PATH}/wd/AoI.gpkg
+  fi
+  
+  AOI_MASK=${OUTPUT_PATH}/wd/AoI_mask.tif
+  if [ "$OVERRIDE_TE" == "TRUE" ]
+  then
+  
+    if [ "$VERBOSE" == "TRUE" ]
+    then
+      echo "Target extent set from AOI input file"
+    fi
+    gdal_rasterize -q -of GTiff -ot Byte -a_nodata 255 -co "COMPRESS=LZW" -tap -tr ${REF_RES} ${REF_RES} -init 0 -burn 1 ${AOI_VFILE} ${AOI_MASK}
+  
+    # update reference extent
+    ULX=$(gdalinfo ${AOI_MASK} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+    ULY=$(gdalinfo ${AOI_MASK} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+    LRX=$(gdalinfo ${AOI_MASK} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+    LRY=$(gdalinfo ${AOI_MASK} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+    
+    XSIZE=$(gdalinfo ${AOI_MASK} | grep "Size is" | sed -e 's/^.*Size is //g' -e 's/,.*//g')
+    YSIZE=$(gdalinfo ${AOI_MASK} | grep "Size is" | sed -e 's/^.*, //g')
+  
+    # align input 'POST_NDVI' to reference extent
+    gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${POST_NDVI} ${OUTPUT_PATH}/wd/$(basename $POST_NDVI).vrt
+    POST_NDVI=${OUTPUT_PATH}/wd/$(basename $POST_NDVI).vrt
+  else
+    gdal_rasterize -q -of GTiff -ot Byte -a_nodata 255 -co "COMPRESS=LZW" -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} -init 0 -burn 1 ${AOI_VFILE} ${AOI_MASK}
+  fi
+fi
+
+# import and combine AoI mask with input raster mask
+if [ ! -z $MASK_FILE ]
+then
+  # check 'MASK_FILE'
+  T_EPSG=$(gdalsrsinfo --single-line -o epsg ${MASK_FILE})
+  T_RES=$(gdalinfo ${MASK_FILE} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+  TULX=$(gdalinfo ${MASK_FILE} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TULY=$(gdalinfo ${MASK_FILE} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRX=$(gdalinfo ${MASK_FILE} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRY=$(gdalinfo ${MASK_FILE} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  # check if input file is a mask
+  MASK_FILE_MAX=$(gdalinfo -mm ${MASK_FILE} | grep "Computed Min/Max" | sed -e 's/^.*Computed Min\/Max*.*,//g' -e 's/[.].*//g')
+  if [ $MASK_FILE_MAX == 0 ]
+  then
+    echo "WARNING: Input mask does not contain supported pixel values (greater than zero). Going on without applying raster mask."
+  else
+
+    if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+    then
+      gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${MASK_FILE} ${OUTPUT_PATH}/wd/$(basename $MASK_FILE)
+      MASK_FILE=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)
+    else
+      if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+      then
+        gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${MASK_FILE} ${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_source.vrt
+        MASK_FILE=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_source.vrt
+      fi
+    fi
+    
+    MASK_FILE_NODATA=$(gdalinfo ${MASK_FILE} | grep "NoData" | sed -e 's/^.*=//g')
+    # combine 'MASK_FILE' with 'AOI_MASK'
+    if [ ! -z $AOI_VFILE ] && [ -f ${AOI_MASK} ]
+    then
+      gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${MASK_FILE} --A_band=1 -B ${AOI_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_AoI_mask.tif --calc="where(A == ${MASK_FILE_NODATA}, 0, where(B == 0, 0, where(A != 0, 1, 0)))"
+      MASK_FILE=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_AoI_mask.tif
+    else
+      gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${MASK_FILE} --A_band=1 --outfile=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_AoI_mask.tif --calc="where(A == ${MASK_FILE_NODATA}, 0, where(A != 0, 1, 0))"
+      MASK_FILE=${OUTPUT_PATH}/wd/$(basename $MASK_FILE)_AoI_mask.tif
+    fi
+    AOI_MASK=${MASK_FILE}
+  fi      
+fi
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Processing dataset to target CRS '${REF_EPSG}'"
+  echo "Target extent (xmin, ymin, xmax, ymax): '${ULX}, ${LRY}, ${LRX}, ${ULY}'"
+  echo "Spatial resolution: '${REF_RES}'"
+  echo ""
+  echo "--------------------------------------------------------------------------------"
+fi
+
+# ################################
+# crop/extend input raster files
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Aligning input raster ..."
+fi
+
+# check 'PRE_NDVI'
+T_EPSG=$(gdalsrsinfo --single-line -o epsg ${PRE_NDVI})
+T_RES=$(gdalinfo ${PRE_NDVI} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+TULX=$(gdalinfo ${PRE_NDVI} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TULY=$(gdalinfo ${PRE_NDVI} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+TLRX=$(gdalinfo ${PRE_NDVI} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TLRY=$(gdalinfo ${PRE_NDVI} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+then
+  gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${PRE_NDVI} ${OUTPUT_PATH}/wd/$(basename $PRE_NDVI)
+  PRE_NDVI=${OUTPUT_PATH}/wd/$(basename $PRE_NDVI)
+else
+  if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+  then
+    gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${PRE_NDVI} ${OUTPUT_PATH}/wd/$(basename $PRE_NDVI).vrt
+    PRE_NDVI=${OUTPUT_PATH}/wd/$(basename $PRE_NDVI).vrt
+  fi
+fi
+
+# check 'PRE_MASK'
+if [ ! -z $PRE_MASK ]
+then
+  T_EPSG=$(gdalsrsinfo --single-line -o epsg ${PRE_MASK})
+  T_RES=$(gdalinfo ${PRE_MASK} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+  TULX=$(gdalinfo ${PRE_MASK} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TULY=$(gdalinfo ${PRE_MASK} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRX=$(gdalinfo ${PRE_MASK} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRY=$(gdalinfo ${PRE_MASK} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+  then
+    gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${PRE_MASK} ${OUTPUT_PATH}/wd/$(basename $PRE_MASK)
+    PRE_MASK=${OUTPUT_PATH}/wd/$(basename $PRE_MASK)
+  else
+    if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+    then
+      gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${PRE_MASK} ${OUTPUT_PATH}/wd/$(basename $PRE_MASK)_source.vrt
+      PRE_MASK=${OUTPUT_PATH}/wd/$(basename $PRE_MASK)_source.vrt
+    fi
+  fi
+fi
+
+# check 'POST_MASK'
+if [ ! -z $POST_MASK ]
+then
+  T_EPSG=$(gdalsrsinfo --single-line -o epsg ${POST_MASK})
+  T_RES=$(gdalinfo ${POST_MASK} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+  TULX=$(gdalinfo ${POST_MASK} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TULY=$(gdalinfo ${POST_MASK} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRX=$(gdalinfo ${POST_MASK} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+  TLRY=$(gdalinfo ${POST_MASK} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+  if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+  then
+    gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${POST_MASK} ${OUTPUT_PATH}/wd/$(basename $POST_MASK)
+    POST_MASK=${OUTPUT_PATH}/wd/$(basename $POST_MASK)
+  else
+    if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+    then
+      gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${POST_MASK} ${OUTPUT_PATH}/wd/$(basename $POST_MASK)_source.vrt
+      POST_MASK=${OUTPUT_PATH}/wd/$(basename $POST_MASK)_source.vrt
+    fi
+  fi
+fi
+
+# check 'POST_NDWI'
+T_EPSG=$(gdalsrsinfo --single-line -o epsg ${POST_NDWI})
+T_RES=$(gdalinfo ${POST_NDWI} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+TULX=$(gdalinfo ${POST_NDWI} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TULY=$(gdalinfo ${POST_NDWI} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+TLRX=$(gdalinfo ${POST_NDWI} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TLRY=$(gdalinfo ${POST_NDWI} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+then
+  gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${POST_NDWI} ${OUTPUT_PATH}/wd/$(basename $POST_NDWI)
+  POST_NDWI=${OUTPUT_PATH}/wd/$(basename $POST_NDWI)
+else
+  if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+  then
+    gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${POST_NDWI} ${OUTPUT_PATH}/wd/$(basename $POST_NDWI).vrt
+    POST_NDWI=${OUTPUT_PATH}/wd/$(basename $POST_NDWI).vrt
+  fi
+fi
+
+# ################################
+# apply input raster masks
+if [ ! -z $PRE_MASK ] || [ ! -z $POST_MASK ]
+then
+  if [ "$VERBOSE" == "TRUE" ]
+  then
+    echo "Applying pre-event and post-event raster mask ..."
+  fi
+fi
+
+# edit scale_factor
+gdal_edit.py -scale 1 ${PRE_NDVI}
+gdal_edit.py -scale 1 ${POST_NDVI}
+gdal_edit.py -scale 1 ${POST_NDWI}
+
+if [ ! -z $PRE_MASK ]
+then
+  # check if input file is a mask
+  PRE_MASK_MAX=$(gdalinfo -mm ${PRE_MASK} | grep "Computed Min/Max" | sed -e 's/^.*Computed Min\/Max*.*,//g' -e 's/[.].*//g')
+  if [ $PRE_MASK_MAX == 0 ]
+  then
+    echo "WARNING: Pre-event mask does not contain supported pixel values (greater than zero). Going on without applying raster mask."
+  else
+    PRE_MASK_NODATA=$(gdalinfo ${PRE_MASK} | grep "NoData" | sed -e 's/^.*=//g')
+    # combine 'PRE_MASK' with 'AOI_MASK'
+    if [ -f $AOI_MASK ]
+    then
+      gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${PRE_MASK} --A_band=1 -B ${AOI_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/$(basename $PRE_MASK)_AoI.tif --calc="where(A == ${PRE_MASK_NODATA}, 0, where(B == 0, 0, where(A != 0, 1, 0)))"
+      PRE_MASK=${OUTPUT_PATH}/wd/$(basename $PRE_MASK)_AoI.tif
+      PRE_MASK_NODATA=$(gdalinfo ${PRE_MASK} | grep "NoData" | sed -e 's/^.*=//g')
+    fi
+    
+    PRE_NDVI_NODATA=$(gdalinfo ${PRE_NDVI} | grep "NoData" | sed -e 's/^.*=//g')
+    gdal_calc.py --quiet --format=GTiff --type=Float32 --NoDataValue=-32768 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${PRE_NDVI} --A_band=1 -B ${PRE_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/PreEvent_NDVI_masked.tif --calc="where(B == ${PRE_MASK_NODATA}, -32768, where(B != 0, where(A == ${PRE_NDVI_NODATA}, -32768, A), -32768))"
+    PRE_NDVI=${OUTPUT_PATH}/wd/PreEvent_NDVI_masked.tif
+  fi
+fi
+if [ ! -z $POST_MASK ]
+then
+  # check if input file is a mask
+  POST_MASK_MAX=$(gdalinfo -mm ${POST_MASK} | grep "Computed Min/Max" | sed -e 's/^.*Computed Min\/Max*.*,//g' -e 's/[.].*//g')
+  if [ $POST_MASK_MAX == 0 ]
+  then
+    echo "WARNING: Post-event mask does not contain supported pixel values (greater than zero). Going on without applying raster mask."
+  else
+    POST_MASK_NODATA=$(gdalinfo ${POST_MASK} | grep "NoData" | sed -e 's/^.*=//g')
+    # combine 'POST_MASK' with 'AOI_MASK'
+    if [ -f $AOI_MASK ]
+    then
+      gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${POST_MASK} --A_band=1 -B ${AOI_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/$(basename $POST_MASK)_AoI.tif --calc="where(A == ${POST_MASK_NODATA}, 0, where(B == 0, 0, where(A != 0, 1, 0)))"
+      POST_MASK=${OUTPUT_PATH}/wd/$(basename $POST_MASK)_AoI.tif
+      POST_MASK_NODATA=$(gdalinfo ${POST_MASK} | grep "NoData" | sed -e 's/^.*=//g')
+    fi
+
+    POST_NDVI_NODATA=$(gdalinfo ${POST_NDVI} | grep "NoData" | sed -e 's/^.*=//g')
+    gdal_calc.py --quiet --format=GTiff --type=Float32 --NoDataValue=-32768 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${POST_NDVI} --A_band=1 -B ${POST_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/PostEvent_NDVI_masked.tif --calc="where(B == ${POST_MASK_NODATA}, -32768, where(B != 0, where(A == ${POST_NDVI_NODATA}, -32768, A), -32768))"
+    POST_NDVI=${OUTPUT_PATH}/wd/PostEvent_NDVI_masked.tif
+    POST_NDWI_NODATA=$(gdalinfo ${POST_NDWI} | grep "NoData" | sed -e 's/^.*=//g')
+    gdal_calc.py --quiet --format=GTiff --type=Float32 --NoDataValue=-32768 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${POST_NDWI} --A_band=1 -B ${POST_MASK} --B_band=1 --outfile=${OUTPUT_PATH}/wd/PostEvent_NDWI_masked.tif --calc="where(B == ${POST_MASK_NODATA}, -32768, where(B != 0, where(A == ${POST_NDWI_NODATA}, -32768, A), -32768))"
+    POST_NDWI=${OUTPUT_PATH}/wd/PostEvent_NDWI_masked.tif
+  fi
+fi
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Exporting combined input mask ..."
+fi
+
+# create full raster mask layer
+gdal_create -q -of GTiff -ot Byte -a_srs ${REF_EPSG} -a_nodata 255 -bands 1 -burn 1 -a_ullr ${ULX} ${ULY} ${LRX} ${LRY} -outsize ${XSIZE} ${YSIZE} -co "COMPRESS=LZW" ${OUTPUT_PATH}/wd/${PREFIX}full_mask.tif
+IA_MASK=${OUTPUT_PATH}/wd/${PREFIX}full_mask.tif
+IE_MASK=${OUTPUT_PATH}/wd/${PREFIX}full_mask.tif
+IF_MASK=${OUTPUT_PATH}/wd/${PREFIX}full_mask.tif
+
+if [ -f $AOI_MASK ]
+then
+  IA_MASK=${AOI_MASK}
+fi
+if [ ! -z $PRE_MASK ] && [ -f $PRE_MASK ]
+then
+  IE_MASK=${PRE_MASK}
+fi
+if [ ! -z $POST_MASK ] && [ -f $POST_MASK ]
+then
+  IF_MASK=${POST_MASK}
+fi
+
+# combine input raster masks
+gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${IA_MASK} --A_band=1 -B ${IE_MASK} --B_band=1 -C ${IF_MASK} --C_band=1 -D ${OUTPUT_PATH}/wd/${PREFIX}full_mask.tif --D_band=1 --outfile=${OUTPUT_PATH}/${PREFIX}Input_mask.tif --calc="(A * B * C * D)"
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Computing difference raster ..."
+fi
+
+# compute RdNDVI
+# gdal_calc.py --quiet --format=GTiff --type=Int16 --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${PRE_NDVI} --A_band=1 -B ${POST_NDVI} --B_band=1 --outfile=${OUTPUT_PATH}/${PREFIX}RdNDVI.tif --calc="rint(where(A.astype(int16) == 0, ((A.astype(int16) * ${PRE_NDVI_SCALE_FACTOR}) - (B.astype(int16) * ${POST_NDVI_SCALE_FACTOR}))/(sqrt(abs(((A.astype(int16) * ${PRE_NDVI_SCALE_FACTOR}) + (1.0 * ${PRE_NDVI_SCALE_FACTOR})) ))), ((A.astype(int16) * ${PRE_NDVI_SCALE_FACTOR}) - (B.astype(int16) * ${POST_NDVI_SCALE_FACTOR}))/(sqrt(abs((A.astype(int16) * ${PRE_NDVI_SCALE_FACTOR}))))) * 10000.0)"
+gdal_calc.py --quiet --format=GTiff --type=Int16 --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${PRE_NDVI} --A_band=1 -B ${POST_NDVI} --B_band=1 --outfile=${OUTPUT_PATH}/${PREFIX}RdNDVI.tif --calc="rint(where(A == 0, (((A * ${PRE_NDVI_SCALE_FACTOR}) - (B * ${POST_NDVI_SCALE_FACTOR}))/(0.0001)), ((A * ${PRE_NDVI_SCALE_FACTOR}) - (B * ${POST_NDVI_SCALE_FACTOR}))/(sqrt(abs((A * ${PRE_NDVI_SCALE_FACTOR}))))) * 10000.0)"
+RDNDVI_SCALE_FACTOR=0.0001
+gdal_edit.py -scale ${RDNDVI_SCALE_FACTOR} ${OUTPUT_PATH}/${PREFIX}RdNDVI.tif
+
+# restore input data scale factor
+gdal_edit.py -scale ${PRE_NDVI_SCALE_FACTOR} ${PRE_NDVI}
+gdal_edit.py -scale ${POST_NDVI_SCALE_FACTOR} ${POST_NDVI}
+
+# remove temporary file
+if [ -f ${OUTPUT_PATH}/wd/PostEvent_NDVI_masked.tif ]
+then
+  rm -rf ${OUTPUT_PATH}/wd/PostEvent_NDVI_masked.tif
+fi
+
+# ################################
+if [ "$MIN_AREA" != "0" ]
+then
+  if [ "$VERBOSE" == "TRUE" ]
+  then
+    echo "Generating pre-event mask for low surrounding NDVI ..."
+  fi
+
+  # use R script for focal filtering 
+  ${SCRIPT_HOME}/focal_filtering.R -k 3 -i ${PRE_NDVI} -o ${OUTPUT_PATH}/wd/PreEvent_NDVI_focal_w3_mask.tif
+  
+fi
+
+# remove temporary file
+if [ -f ${OUTPUT_PATH}/wd/PreEvent_NDVI_masked.tif ]
+then
+  rm -rf ${OUTPUT_PATH}/wd/PreEvent_NDVI_masked.tif
+fi
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Masking out difference raster ..."
+fi
+
+# remove pixels based on mask, AOI and soil sealing
+
+# create water mask
+POST_NDWI_THRESHOLD=0.1
+# # edit scale_factor
+# gdal_edit.py -scale 1 ${POST_NDWI}
+# compute mask
+gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=-32768 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${POST_NDWI} --A_band=1 --outfile=${OUTPUT_PATH}/wd/${PREFIX}water_mask.tif --calc="where((A.astype(int16) * ${POST_NDWI_SCALE_FACTOR}) > ${POST_NDWI_THRESHOLD}, 0, 1)"
+# restore input data scale factor
+gdal_edit.py -scale ${POST_NDWI_SCALE_FACTOR} ${POST_NDWI}
+
+# remove temporary file
+if [ -f ${OUTPUT_PATH}/wd/PostEvent_NDWI_masked.tif ]
+then
+  rm -rf ${OUTPUT_PATH}/wd/PostEvent_NDWI_masked.tif
+fi
+
+# check input soil sealing mask
+if [ ! -z $SS_FILE ]
+then
+  # check if input file is a mask
+  SS_FILE_MAX=$(gdalinfo -mm ${SS_FILE} | grep "Computed Min/Max" | sed -e 's/^.*Computed Min\/Max*.*,//g' -e 's/[.].*//g')
+  if [ $SS_FILE_MAX != 1 ]
+  then
+    echo "WARNING: Input artificial surfaces raster mask does non contain supported pixel values (1 or 0-1). Going on without applying raster mask."
+    SS_MASK=""
+  else
+    
+    # check 'SS_FILE'
+    T_EPSG=$(gdalsrsinfo --single-line -o epsg ${SS_FILE})
+    T_RES=$(gdalinfo ${SS_FILE} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+    TULX=$(gdalinfo ${SS_FILE} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+    TULY=$(gdalinfo ${SS_FILE} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+    TLRX=$(gdalinfo ${SS_FILE} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+    TLRY=$(gdalinfo ${SS_FILE} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+    if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+    then
+      gdalwarp -q -of GTiff -r near -t_srs ${REF_EPSG} -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${SS_FILE} ${OUTPUT_PATH}/wd/$(basename $SS_FILE)
+      SS_FILE=${OUTPUT_PATH}/wd/$(basename $SS_FILE)
+    else
+      if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+      then
+        gdal_translate -q -of VRT -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${SS_FILE} ${OUTPUT_PATH}/wd/$(basename $SS_FILE).vrt
+        SS_FILE=${OUTPUT_PATH}/wd/$(basename $SS_FILE).vrt
+      fi
+    fi
+
+    # generate soil sealing mask (using proximity)
+    MAX_GEO_DIST=$(echo "1.5 * $REF_RES" |bc -l)
+    gdal_proximity.py -q -of GTiff -ot Byte -co "COMPRESS=LZW" -distunits GEO -maxdist ${MAX_GEO_DIST} -nodata 0 -values 1 -fixed-buf-val 1 ${SS_FILE} ${OUTPUT_PATH}/wd/Artifical_surfaces_mask_buffered.tif
+    # combine with source artificial surfaces mask
+    gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${SS_FILE} --A_band=1 -B ${OUTPUT_PATH}/wd/Artifical_surfaces_mask_buffered.tif --B_band=1 --outfile=${OUTPUT_PATH}/wd/Artifical_surfaces_mask.tif --calc="where(logical_or(A == 1, B == 1), 0, 1)"
+    SS_MASK=${OUTPUT_PATH}/wd/Artifical_surfaces_mask.tif
+  fi
+fi
+
+# combine masks
+A_MASK=${OUTPUT_PATH}/wd/${PREFIX}water_mask.tif
+B_MASK=${OUTPUT_PATH}/wd/${PREFIX}water_mask.tif
+C_MASK=${OUTPUT_PATH}/wd/${PREFIX}water_mask.tif
+if [ -f $AOI_MASK ]
+then
+  B_MASK=${AOI_MASK}
+fi
+if [ "$SS_MASK" != "" ] && [ -f $SS_MASK ]
+then
+  C_MASK=${SS_MASK}
+fi
+# combine masks
+# gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${A_MASK} --A_band=1 -B ${B_MASK} --B_band=1 -C ${C_MASK} --C_band=1 --outfile=${OUTPUT_PATH}/wd/Final_mask.tif --calc="where(logical_and(logical_and(A == 1, B == 1), B == 1), 1, 0)"
+gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${A_MASK} --A_band=1 -B ${B_MASK} --B_band=1 -C ${C_MASK} --C_band=1 --outfile=${OUTPUT_PATH}/wd/Final_mask.tif --calc="(A * B * C)"
+
+# edit scale_factor
+gdal_edit.py -scale 1 ${OUTPUT_PATH}/${PREFIX}RdNDVI.tif
+# apply mask to RdNDVI
+gdal_calc.py --quiet --format=GTiff --type=Int16 --NoDataValue=-32768 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${OUTPUT_PATH}/wd/Final_mask.tif --A_band=1 -B ${OUTPUT_PATH}/${PREFIX}RdNDVI.tif --B_band=1 --outfile=${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif --calc="rint(where(A.astype(int16) == 1, B.astype(int16), -32768))"
+gdal_edit.py -scale ${RDNDVI_SCALE_FACTOR} ${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif
+gdal_edit.py -scale ${RDNDVI_SCALE_FACTOR} ${OUTPUT_PATH}/${PREFIX}RdNDVI.tif
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Applying RdNDVI threshold of '${RDNDVI_THRESHOLD}' ..."
+fi
+
+# keep only values above a certain threshold
+gdal_edit.py -scale 1 ${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif
+gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif --A_band=1 --outfile=${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass1.tif --calc="where(A.astype(int16) > (${RDNDVI_THRESHOLD} / ${RDNDVI_SCALE_FACTOR}), 1, 0)"
+gdal_edit.py -scale ${RDNDVI_SCALE_FACTOR} ${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif
+
+# ################################
+SLOPE_THRESHOLD=3
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Applying slope threshold of '${SLOPE_THRESHOLD}' degrees ..."
+fi
+
+# calculate slope raster from DEM
+# check 'DEM_FILE'
+T_EPSG=$(gdalsrsinfo --single-line -o epsg ${DEM_FILE})
+T_RES=$(gdalinfo ${DEM_FILE} | grep "Pixel Size" | sed -e 's/.*Pixel Size = \(.*\),.*/\1/' -e 's/[^0-9.]//g')
+TULX=$(gdalinfo ${DEM_FILE} | grep "Upper Left" | sed -e 's/.*Upper Left \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TULY=$(gdalinfo ${DEM_FILE} | grep "Upper Left" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+TLRX=$(gdalinfo ${DEM_FILE} | grep "Lower Right" | sed -e 's/.*Lower Right \(.*\), .*) (.*/\1/' -e 's/[^0-9.]//g')
+TLRY=$(gdalinfo ${DEM_FILE} | grep "Lower Right" | sed -e 's/.*, \(.*\) (.*/\1/' -e 's/[^0-9.]//g')
+if [ $T_EPSG != $REF_EPSG ] || [ $T_RES != $REF_RES ]
+then
+  gdalwarp -q -of GTiff -r bilinear -t_srs ${REF_EPSG} -co "COMPRESS=LZW" -te ${ULX} ${LRY} ${LRX} ${ULY} -tr ${REF_RES} ${REF_RES} ${DEM_FILE} ${OUTPUT_PATH}/wd/dem.tif
+  DEM_FILE=${OUTPUT_PATH}/wd/dem.tif
+else
+  if [ $TULX != $ULX ] || [ $TULY != $ULY ] || [ $TLRX != $LRX ] || [ $TLRX != $LRY ]
+  then
+    gdal_translate -q -of VRT -co "COMPRESS=LZW" -projwin ${ULX} ${ULY} ${LRX} ${LRY} ${DEM_FILE} ${OUTPUT_PATH}/wd/dem.vrt
+    DEM_FILE=${OUTPUT_PATH}/wd/dem.vrt
+  fi
+fi
+# compute slope
+gdaldem slope ${DEM_FILE} ${OUTPUT_PATH}/wd/slope.tif -q
+
+# remove areas with slope lower than 'SLOPE_THRESHOLD'
+gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --hideNoData --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass1.tif --A_band=1 -B ${OUTPUT_PATH}/wd/slope.tif --B_band=1 --outfile=${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass2.tif --calc="where(logical_and(B.astype(float32) > ${SLOPE_THRESHOLD}, A.astype(int16) == 1), 1, 0)"
+
+FINAL_MASK=${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass2.tif
+
+# ################################
+if [ "$MIN_AREA" != "0" ]
+then
+  if [ "$VERBOSE" == "TRUE" ]
+  then
+    echo "Cleaning landslides mask using pre-event vegetation coverage information ..."
+  fi
+  
+  # use sieve filtering
+  MAX_SIEVE_PIXEL=$(echo "($MIN_AREA/($REF_RES*$REF_RES))+1" | bc -l | sed -n -e 's/[.].*//p')
+  gdal_sieve.py -q -st 5 -4 -nomask ${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass2.tif ${OUTPUT_PATH}/wd/${PREFIX}landslides_mask_sieve.tif
+  
+  # filter single pixels in areas with previous low surrounding NDVI
+  gdal_calc.py --quiet --format=GTiff --type=Byte --NoDataValue=255 --co "COMPRESS=LZW" --co "NUM_THREADS=ALL_CPUS" --co "TILED=YES" --co "BLOCKXSIZE=256" --co "BLOCKYSIZE=256" -A ${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass2.tif --A_band=1 -B ${OUTPUT_PATH}/wd/${PREFIX}landslides_mask_sieve.tif --B_band=1 -C ${OUTPUT_PATH}/wd/PreEvent_NDVI_focal_w3_mask.tif --C_band=1 --outfile=${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass3.tif --calc="where(logical_and(A == 1, B == 1), 1, where(logical_and(A == 1, C == 1), 1, 0))"
+  
+  # ################################
+  if [ "$VERBOSE" == "TRUE" ]
+  then
+    echo "Cleaning landslides mask geometries using sieve filtering ..."
+    echo "Small Area Threshold: ${MIN_AREA}"
+  fi
+  
+  MAX_SIEVE_PIXEL=$(echo "($MIN_AREA/($REF_RES*$REF_RES))+1" | bc -l | sed -n -e 's/[.].*//p')
+  gdal_sieve.py -q -st ${MAX_SIEVE_PIXEL} -4 ${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass3.tif -mask ${OUTPUT_PATH}/wd/${PREFIX}landslides_mask_sieve.tif ${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass4.tif
+  
+  FINAL_MASK=${OUTPUT_PATH}/wd/${PREFIX}RdNDVI_mask_pass4.tif
+
+fi
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Exporting final raster mask ..."
+fi
+
+# generate final landslides mask
+gdal_translate -q -of GTiff -ot Byte -a_nodata 255 -co "COMPRESS=LZW" -co "TILED=YES" -co "BLOCKXSIZE=256" -co "BLOCKYSIZE=256" ${FINAL_MASK} ${OUTPUT_PATH}/${PREFIX}Landslides_mask.tif
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Converting to vector GeoPackage ..."
+fi
+
+# convert to vector
+gdal_polygonize.py -q -mask ${OUTPUT_PATH}/${PREFIX}Landslides_mask.tif ${OUTPUT_PATH}/${PREFIX}Landslides_mask.tif -f GPKG ${OUTPUT_PATH}/wd/${PREFIX}landslides_mask.gpkg "P_${PREFIX}landslides" landslide
+
+# ################################
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "Computing CONFIDENCE ..."
+fi
+
+${SCRIPT_HOME}/compute_confidence.R --extra -i ${OUTPUT_PATH}/wd/${PREFIX}landslides_mask.gpkg -o ${OUTPUT_PATH}/${PREFIX}Landslides.gpkg -s ${OUTPUT_PATH}/wd/slope.tif -d ${DEM_FILE} -r ${OUTPUT_PATH}/${PREFIX}RdNDVI_masked.tif
+
+# remove temporary directory
+# rmdir ${OUTPUT_PATH}/wd &> /dev/null
+rm -rf ${OUTPUT_PATH}/wd
+
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo ""
+  echo "Done!"
+fi
+
+# ########################################
+# compute overall computation time
+# get time interval in nanoseconds
+T="$(($(date +%s%N)-START_CYCLE))"
+# Seconds
+S="$((T/1000000000))"
+# Milliseconds
+M="$((T%1000000000/1000000))"
+
+if [ "$VERBOSE" == "TRUE" ]
+then
+  echo "--------------------------------------------------------------------------------"
+  echo "Processing ended at $(date)" >&1
+  printf "Elapsed time: %02d:%02d:%02d:%02d.%03d\n" "$((S/86400))" "$((S/3600%24))" "$((S/60%60))" "$((S%60))" "${M}" >&1
+  echo "--------------------------------------------------------------------------------"
+fi
+
