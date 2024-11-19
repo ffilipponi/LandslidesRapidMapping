@@ -1,5 +1,5 @@
 # Landslides detector
-### Command line tool to perform landslides mapping from remote sensing optical multispectral imagery
+### Command line tool to perform landslides rapid mapping from remote sensing optical multispectral imagery using a hybrid pixel-based and object-based image analysis approach
 
 The tool can be easily used through a docker container by building a dedicated image from the Dockerfile, that contains all the required free libraries and software dependencies.
 
